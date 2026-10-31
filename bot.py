@@ -28,7 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("homelander")
+log = logging.getLogger("shivannnkk-instagram-monitor")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -100,7 +100,7 @@ async def send_event(channel: discord.abc.Messageable, monitor, event: str, prof
         if profile.latest_post_url:
             caption = (profile.latest_post_caption or "View the latest post").replace("\n", " ")[:180]
             embed.add_field(name="Latest post", value=f"[{caption}]({profile.latest_post_url})", inline=False)
-        embed.set_footer(text="Homelander Instagram Monitor • automatic detection")
+        embed.set_footer(text="shivannnkk • Instagram Monitor • automatic detection")
 
     card_path = None
     try:
@@ -128,9 +128,13 @@ async def on_ready():
     try:
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
+            # Rebuild this guild's command set from the current definitions.
+            # Clearing first removes stale remote commands such as old /ban or
+            # /unban registrations that no longer exist in the bot.
+            bot.tree.clear_commands(guild=guild)
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
-            log.info("Synced %d guild commands.", len(synced))
+            log.info("Synced %d guild commands for guild %s.", len(synced), GUILD_ID)
         else:
             synced = await bot.tree.sync()
             log.info("Synced %d global commands.", len(synced))

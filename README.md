@@ -1,4 +1,4 @@
-# 🇺🇸 Homelander Instagram Monitor Bot
+# 🇺🇸 shivannnkk Instagram Monitor Bot
 
 A Discord slash-command bot that monitors Instagram usernames and automatically posts a Discord alert when an account changes between **active** and **unavailable**.
 

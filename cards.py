@@ -66,6 +66,9 @@ def create_profile_card(profile, username, unavailable=False):
     draw.text((545, 190), f"{num(followers)} followers", fill=white, font=_font(27))
     draw.text((780, 190), f"{num(following)} following", fill=white, font=_font(27))
 
+    # Visible ownership watermark on every generated profile card.
+    draw.text((W - 210, H - 38), "shivannnkk", fill=(145, 145, 145), font=_font(20, True))
+
     if unavailable:
         draw.text((345, 250), "UserNotFound", fill=gray, font=_font(22))
     else:
@@ -77,6 +80,6 @@ def create_profile_card(profile, username, unavailable=False):
             post_text = (caption or "No caption").replace("\n", " ")[:58]
             draw.text((345, 330), post_text, fill=gray, font=_font(18))
 
-    out = Path(tempfile.gettempdir()) / f"homelander_{username}.png"
+    out = Path(tempfile.gettempdir()) / f"shivannnkk_{username}.png"
     bg.save(out, "PNG")
     return str(out)

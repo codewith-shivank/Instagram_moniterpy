@@ -7,6 +7,8 @@ from typing import Iterable
 import discord
 
 
+BRAND = "shivannnkk"
+
 COLORS = {
     "active": discord.Color.green(),
     "monitoring": discord.Color.blurple(),
@@ -50,7 +52,7 @@ def format_timestamp(value: datetime | str | None) -> str:
 
 def base_embed(title: str, description: str | None = None, status: str = "neutral") -> discord.Embed:
     embed = discord.Embed(title=title, description=description, color=COLORS.get(status, COLORS["neutral"]))
-    embed.set_footer(text="Instagram Monitor • status is based on the latest verified check")
+    embed.set_footer(text=f"shivannnkk • Instagram Monitor • status is based on the latest verified check")
     return embed
 
 
@@ -108,6 +110,6 @@ def paged_embeds(title: str, rows: Iterable[str], *, page_size: int = 8, status:
     for offset in range(0, len(values), page_size):
         page = values[offset:offset + page_size]
         embed = base_embed(title, "\n".join(page), status)
-        embed.set_footer(text=f"Instagram Monitor • page {offset // page_size + 1}/{max(1, (len(values) + page_size - 1) // page_size)}")
+        embed.set_footer(text=f"shivannnkk • Instagram Monitor • page {offset // page_size + 1}/{max(1, (len(values) + page_size - 1) // page_size)}")
         pages.append(embed)
     return pages or [empty_embed(title, "Nothing to show yet.")]
