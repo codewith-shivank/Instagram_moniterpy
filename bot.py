@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from database import Database, AlertConfig
 from instagram import InstagramChecker, AccountState
 from cards import create_profile_card
+from ui import account_url, base_embed, empty_embed, error_embed, format_timestamp, paged_embeds, short_username, status_text, PageView
 
 load_dotenv()
 
@@ -74,18 +75,15 @@ async def fetch_confirmed(username: str, expected: AccountState | None = None):
 
 async def send_event(channel: discord.abc.Messageable, monitor, event: str, profile, config: AlertConfig):
     elapsed = elapsed_text(int((utcnow() - monitor.started_at).total_seconds()))
-    if event == "banned":
-        title = f"🔴 @{monitor.username} unavailable"
-        followers = profile.followers_display if profile else f"{monitor.followers:,}"
-        line = f"Last confirmed active: {elapsed} ago\\nMonitoring duration: {elapsed}\\nLast known followers: {followers}"
-        accent = "red"
-    else:
-        followers = profile.followers_display if profile else "Unknown"
-        title = f"🏆 Account Recovered | @{monitor.username} ✅"
-        line = f"👥 Followers: {followers} | ⏱️ Time Elapsed: {elapsed}"
-        accent = "green"
-
-    embed = discord.Embed(title=title, description=line, color=discord.Color.red() if accent == "red" else discord.Color.green())
+    unavailable = event == "banned"
+    status = "unavailable" if unavailable else "active"
+    title = f"Account {status_text(status).title()} • @{short_username(monitor.username)}"
+    followers = profile.followers_display if profile else (f"{monitor.followers:,}" if unavailable else "Unknown")
+    embed = base_embed(title, f"The latest confirmed check reports this account as **{status_text(status)}**.", status)
+    embed.add_field(name="Status", value=f"`{status_text(status)}`", inline=True)
+    embed.add_field(name="Followers", value=followers, inline=True)
+    embed.add_field(name="Monitoring duration", value=elapsed, inline=True)
+    embed.add_field(name="Detected", value=format_timestamp(utcnow()), inline=False)
     if config.style == "plain":
         embed = None
     mention = ""
@@ -99,6 +97,9 @@ async def send_event(channel: discord.abc.Messageable, monitor, event: str, prof
         embed.add_field(name="Posts", value=str(profile.posts), inline=True)
         embed.add_field(name="Followers", value=profile.followers_display, inline=True)
         embed.add_field(name="Following", value=profile.following_display, inline=True)
+        if profile.latest_post_url:
+            caption = (profile.latest_post_caption or "View the latest post").replace("\n", " ")[:180]
+            embed.add_field(name="Latest post", value=f"[{caption}]({profile.latest_post_url})", inline=False)
         embed.set_footer(text="Homelander Instagram Monitor • automatic detection")
 
     card_path = None
@@ -145,7 +146,7 @@ async def on_ready():
 async def ban(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message("❌ Invalid Instagram username.", ephemeral=True)
+        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
 
     await interaction.response.defer()
     try:
@@ -163,36 +164,32 @@ async def ban(interaction: discord.Interaction, username: str):
         )
 
     db.add_monitor(username, "ban", interaction.channel_id, interaction.user.id, result, interaction.guild_id)
-    await interaction.followup.send(
-        f"🔴 **Ban monitoring started** for **@{username}**.\n"
-        f"Current status: 🟢 Active\n"
-        f"I'll automatically alert this channel when the account becomes unavailable."
-    )
+    embed = base_embed(f"Monitoring started • @{short_username(username)}", "The account is currently verified as active.", "monitoring")
+    embed.add_field(name="Current status", value="`ACTIVE`", inline=True)
+    embed.add_field(name="Watch", value="Until unavailable", inline=True)
+    embed.add_field(name="Alerts", value="This channel and configured destinations", inline=False)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="unban", description="Monitor an unavailable Instagram account until it recovers.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def unban(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message("❌ Invalid Instagram username.", ephemeral=True)
+        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
 
     await interaction.response.defer()
     result = await checker.check(username)
     if result.state == AccountState.UNKNOWN:
-        return await interaction.followup.send(
-            f"⚠️ I couldn't verify @{username} right now. Try again in a moment."
-        )
+        return await interaction.followup.send(embed=base_embed(f"Unable to verify • @{short_username(username)}", "Instagram did not provide a reliable answer. This does not confirm a ban or deletion.", "neutral"))
     if result.state == AccountState.ACTIVE:
-        return await interaction.followup.send(
-            f"⚠️ @{username} already appears active. Use `/ban {username}` to monitor a future ban."
-        )
+        return await interaction.followup.send(embed=base_embed(f"Already active • @{short_username(username)}", f"Use `/ban {short_username(username)}` to monitor a future unavailable transition.", "active"))
 
     db.add_monitor(username, "unban", interaction.channel_id, interaction.user.id, result, interaction.guild_id)
-    await interaction.followup.send(
-        f"🟢 **Recovery monitoring started** for **@{username}**.\n"
-        f"Current status: 🔴 Unavailable\n"
-        f"I'll automatically alert this channel when the account becomes available again."
-    )
+    embed = base_embed(f"Recovery monitoring started • @{short_username(username)}", "The account is currently verified as unavailable.", "monitoring")
+    embed.add_field(name="Current status", value="`UNAVAILABLE`", inline=True)
+    embed.add_field(name="Watch", value="Until active again", inline=True)
+    embed.add_field(name="Alerts", value="This channel and configured destinations", inline=False)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="stop", description="Stop monitoring an Instagram account.")
 @app_commands.describe(username="Instagram username or profile URL")
@@ -200,28 +197,34 @@ async def stop(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     removed = db.stop_monitor(username, interaction.guild_id)
     if not removed:
-        return await interaction.response.send_message(
-            f"⚠️ @{username} is not currently being monitored in this server.", ephemeral=True
-        )
-    await interaction.response.send_message(f"🛑 Stopped monitoring **@{username}** in this server.")
+        return await interaction.response.send_message(embed=empty_embed("Monitor not found", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
+    embed = base_embed(f"Monitoring stopped • @{short_username(username)}", "No further automatic transition alerts will be sent.", "changed")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="list", description="List all active Instagram monitors.")
 async def list_monitors(interaction: discord.Interaction):
-    monitors = db.get_monitors(interaction.guild_id)
-    if not monitors:
-        return await interaction.response.send_message("📱 No active monitors.")
+    try:
+        monitors = db.get_monitors(interaction.guild_id)
+        if not monitors:
+            return await interaction.response.send_message(embed=empty_embed("No active monitors", "Use `/ban` or `/unban` to start watching an account."))
 
-    ban_items = [m for m in monitors if m.mode == "ban"]
-    unban_items = [m for m in monitors if m.mode == "unban"]
-    lines = ["📱 **Instagram Monitors**", ""]
-    lines.append("🔴 **BAN MONITORS**")
-    lines.extend([f"• @{m.username}" for m in ban_items] or ["• None"])
-    lines.append("")
-    lines.append("🟢 **RECOVERY MONITORS**")
-    lines.extend([f"• @{m.username}" for m in unban_items] or ["• None"])
-    lines.append("")
-    lines.append(f"**Total:** {len(monitors)}")
-    await interaction.response.send_message("\n".join(lines))
+        rows = []
+        for monitor in monitors:
+            watch = "unavailable → active" if monitor.mode == "unban" else "active → unavailable"
+            checked = format_timestamp(monitor.last_checked)
+            rows.append(f"**[@{short_username(monitor.username)}]({account_url(monitor.username)})**\n`{status_text(monitor.last_state.value)}` • `{watch}`\nFollowers: **{monitor.followers:,}** • Checked: {checked}")
+        pages = paged_embeds(f"Active monitors • {len(monitors)} account(s)", rows, status="monitoring")
+        view = PageView(pages) if len(pages) > 1 else None
+        await interaction.response.send_message(embed=pages[0], view=view)
+        if view:
+            view.message = await interaction.original_response()
+    except Exception:
+        log.exception("/list failed")
+        message = "⚠️ I couldn't load the monitor list. Check the bot logs for details."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
 @bot.tree.command(name="alert-channel", description="Add or remove an alert destination channel.")
 @app_commands.describe(action="add or remove", channel="Channel to receive alerts")
@@ -230,7 +233,8 @@ async def list_monitors(interaction: discord.Interaction):
 async def alert_channel(interaction: discord.Interaction, action: app_commands.Choice[str], channel: discord.TextChannel):
     if action.value == "add": db.add_destination(interaction.guild_id, channel.id)
     else: db.remove_destination(interaction.guild_id, channel.id)
-    await interaction.response.send_message(f"Alert channel {action.value}d: {channel.mention}", ephemeral=True)
+    embed = base_embed("Alert destination updated", f"{channel.mention} is now {'included in' if action.value == 'add' else 'removed from'} automatic alerts.", "changed")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="alert-config", description="Configure alert style, cooldown, roles, summaries, webhooks and DMs.")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -247,43 +251,98 @@ async def alert_config(interaction: discord.Interaction, style: str="embed", coo
             return await interaction.response.send_message(f"Unknown role ID(s): {', '.join(map(str, missing))}", ephemeral=True)
     cfg = AlertConfig(interaction.guild_id, style, cooldown, role_ids, everyone, dm, webhook or None, summary, interaction.channel_id if summary != "off" else None)
     db.save_config(cfg)
-    await interaction.response.send_message("✅ Alert configuration saved.", ephemeral=True)
+    embed = base_embed("Alert configuration saved", "Future automatic notifications will use these settings.", "changed")
+    embed.add_field(name="Style", value=f"`{style.upper()}`", inline=True)
+    embed.add_field(name="Cooldown", value=f"{cooldown}s", inline=True)
+    embed.add_field(name="Summary", value=f"`{summary.upper()}`", inline=True)
+    embed.add_field(name="Mentions", value="Everyone enabled" if everyone else "Role mentions only", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="history", description="Show recent monitoring events.")
-@app_commands.describe(limit="Number of events to show (1-20)")
-async def history(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10):
-    rows = db.get_history(limit, interaction.guild_id)
-    if not rows:
-        return await interaction.response.send_message("📜 No monitoring history yet.")
-    lines = ["📜 **Monitoring History**", ""]
-    for row in rows:
-        emoji = "❌" if row["event"] == "banned" else "🏆"
-        lines.append(
-            f"{emoji} **@{row['username']}** — {row['event'].title()} — "
-            f"{elapsed_text(row['elapsed_seconds'])}"
-        )
-    await interaction.response.send_message("\n".join(lines))
+@app_commands.describe(limit="Number of events to show (1-20)", username="Optional account filter", oldest_first="Show oldest events first")
+async def history(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10, username: str = "", oldest_first: bool = False):
+    try:
+        username = clean_username(username) if username else None
+        rows = db.get_history(int(limit), interaction.guild_id, username, oldest_first)
+        if not rows:
+            return await interaction.response.send_message(embed=empty_embed("No monitoring history", "Confirmed account status changes will appear here after monitoring begins."))
+
+        lines = []
+        for row in rows:
+            status = "UNAVAILABLE" if row["event"] == "banned" else "ACTIVE"
+            details = f"{row['followers']:,} followers" if row['followers'] else "Follower count unavailable"
+            lines.append(f"**@{short_username(row['username'])}** • `{status}`\n{format_timestamp(row['detected_at'])} • {details} • monitored {elapsed_text(row['elapsed_seconds'])}")
+        pages = paged_embeds("Status history", lines, page_size=5, status="changed")
+        view = PageView(pages) if len(pages) > 1 else None
+        await interaction.response.send_message(embed=pages[0], view=view)
+        if view:
+            view.message = await interaction.original_response()
+    except Exception:
+        log.exception("/history failed")
+        message = "⚠️ I couldn't load monitoring history. Check the bot logs for details."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+@bot.tree.command(name="dashboard", description="Open the monitoring dashboard.")
+async def dashboard(interaction: discord.Interaction):
+    monitors = db.get_monitors(interaction.guild_id)
+    stats = db.get_statistics(interaction.guild_id)
+    embed = base_embed("Instagram Monitor Dashboard", "A quick view of monitoring, account health, and recent activity.", "monitoring")
+    embed.add_field(name="Accounts monitored", value=str(stats["monitored"]), inline=True)
+    embed.add_field(name="Active", value=str(stats["active"] or 0), inline=True)
+    embed.add_field(name="Unavailable", value=str(stats["unavailable"] or 0), inline=True)
+    embed.add_field(name="Followers monitored", value=f"{stats['followers']:,}", inline=True)
+    embed.add_field(name="Confirmed unavailable events", value=str(stats["unavailable_events"]), inline=True)
+    embed.add_field(name="Confirmed recovery events", value=str(stats["recovered_events"]), inline=True)
+    embed.add_field(name="Navigation", value="Use `/list` for accounts, `/status` for details, and `/history` for activity.", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="account", description="Show the saved monitoring details for an account.")
+@app_commands.describe(username="Instagram username or profile URL")
+async def account(interaction: discord.Interaction, username: str):
+    username = clean_username(username)
+    if not username:
+        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
+    monitor = db.get_monitor(username, interaction.guild_id)
+    if not monitor:
+        return await interaction.response.send_message(embed=empty_embed("Account not monitored", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
+    embed = base_embed(f"Account details • @{short_username(username)}", f"[Open Instagram profile]({account_url(username)})", monitor.last_state.value)
+    embed.add_field(name="Status", value=f"`{status_text(monitor.last_state.value)}`", inline=True)
+    embed.add_field(name="Followers", value=f"{monitor.followers:,}", inline=True)
+    embed.add_field(name="Watch", value="Recovery" if monitor.mode == "unban" else "Availability", inline=True)
+    embed.add_field(name="Monitoring started", value=format_timestamp(monitor.started_at), inline=False)
+    embed.add_field(name="Last checked", value=format_timestamp(monitor.last_checked), inline=False)
+    if monitor.profile_pic_url:
+        embed.set_thumbnail(url=monitor.profile_pic_url)
+    await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="status", description="Check the current status of an Instagram account.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def status(interaction: discord.Interaction, username: str):
     username = clean_username(username)
+    if not username:
+        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
     await interaction.response.defer()
     result = await checker.check(username)
     if result.state == AccountState.UNKNOWN:
-        return await interaction.followup.send(f"⚠️ Could not verify @{username} right now.")
+        return await interaction.followup.send(embed=base_embed(f"Account status • @{short_username(username)}", "Instagram did not provide a reliable answer. This does not confirm a ban or deletion. Try again later.", "neutral"))
     profile = result.profile
-    embed = discord.Embed(
-        title=f"📱 Instagram Status — @{username}",
-        color=discord.Color.green() if result.state == AccountState.ACTIVE else discord.Color.red()
-    )
-    embed.add_field(name="Status", value="🟢 Active" if result.state == AccountState.ACTIVE else "🔴 Unavailable", inline=False)
+    status = result.state.value
+    embed = base_embed(f"Account status • @{short_username(username)}", "Latest verified Instagram check.", status if status in ("active", "unavailable") else "neutral")
+    embed.add_field(name="Status", value=f"`{status_text(status)}`", inline=False)
     if profile:
         embed.add_field(name="Posts", value=str(profile.posts), inline=True)
         embed.add_field(name="Followers", value=profile.followers_display, inline=True)
         embed.add_field(name="Following", value=profile.following_display, inline=True)
         if profile.profile_pic_url:
             embed.set_thumbnail(url=profile.profile_pic_url)
+        if profile.latest_post_url:
+            caption = (profile.latest_post_caption or "View the latest post").replace("\n", " ")[:180]
+            embed.add_field(name="Latest post", value=f"[{caption}]({profile.latest_post_url})", inline=False)
     await interaction.followup.send(embed=embed)
 
 @tasks.loop(hours=1)
@@ -299,13 +358,13 @@ async def summary_loop():
         if not channel:
             continue
         if rows:
-            lines = [f"📊 **{cfg.summary_frequency.title()} Instagram Summary**", ""]
+            embed = base_embed(f"{cfg.summary_frequency.title()} monitoring summary", f"{len(rows)} confirmed status change(s) since the previous summary.", "changed")
             for row in rows[:20]:
-                emoji = "❌" if row["event"] == "banned" else "🏆"
-                lines.append(f"{emoji} **@{row['username']}** — {row['event'].title()} — {elapsed_text(row['elapsed_seconds'])}")
-            await channel.send("\n".join(lines))
+                status = "UNAVAILABLE" if row["event"] == "banned" else "ACTIVE"
+                embed.add_field(name=f"@{short_username(row['username'])} • {status}", value=f"{format_timestamp(row['detected_at'])}\nMonitored for {elapsed_text(row['elapsed_seconds'])}", inline=False)
+            await channel.send(embed=embed)
         else:
-            await channel.send(f"📊 **{cfg.summary_frequency.title()} Instagram Summary**\nNo monitoring events recorded.")
+            await channel.send(embed=empty_embed(f"{cfg.summary_frequency.title()} monitoring summary", "No confirmed monitoring changes were recorded."))
         db.mark_summary_sent(cfg.guild_id, now)
 
 @tasks.loop(seconds=CHECK_INTERVAL)

@@ -13,6 +13,7 @@ A Discord slash-command bot that monitors Instagram usernames and automatically 
 - SQLite persistence.
 - Auto-resume after bot restart.
 - Automatic Discord alerts.
+- Consistent mobile-friendly embeds with clear status labels, timestamps, empty/error states, and pagination for monitor/history lists.
 - Instagram-style profile card with profile photo and statistics.
 - Confirmation checks to reduce false ban/recovery alerts.
 - Multiple alert channels, per-server styles (`embed`/`plain`), cooldowns, selected role mentions, permission-gated `@everyone`, DMs, webhooks, and daily/weekly summary configuration.
@@ -100,6 +101,8 @@ When connected, the bot will load the SQLite database and automatically resume e
 /list
 /history
 /status username
+/dashboard
+/account username
 /alert-channel action:<add|remove> channel:<channel>
 /alert-config style:<embed|plain> cooldown:<seconds> roles:<role IDs> everyone:<true|false> dm:<true|false> webhook:<URL> summary:<off|daily|weekly>
 ```

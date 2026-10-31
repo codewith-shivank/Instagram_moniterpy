@@ -8,7 +8,7 @@ from instagram import AccountState
 @dataclass
 class Monitor:
     username: str; mode: str; channel_id: int; user_id: int; guild_id: int|None; started_at: datetime; last_state: AccountState
-    followers: int = 0; following: int = 0; posts: int = 0
+    followers: int = 0; following: int = 0; posts: int = 0; last_checked: datetime|None = None; profile_pic_url: str|None = None
 @dataclass
 class AlertConfig:
     guild_id: int; style: str='embed'; cooldown_seconds: int=0; role_ids: tuple[int,...]=(); everyone: bool=False; dm_alerts: bool=False; webhook_url: str|None=None; summary_frequency: str='off'; summary_channel_id: int|None=None; last_summary_at: datetime|None=None
@@ -45,6 +45,10 @@ class Database:
     def add_monitor(self,u,m,ch,uid,result,guild_id=None):
         now=datetime.now(timezone.utc).isoformat(); p=result.profile
         with self._connect() as c: c.execute('INSERT INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(username,guild_id) DO UPDATE SET mode=excluded.mode,channel_id=excluded.channel_id,user_id=excluded.user_id,started_at=excluded.started_at,last_state=excluded.last_state,last_checked=excluded.last_checked,followers=excluded.followers,following=excluded.following,posts=excluded.posts,profile_pic_url=excluded.profile_pic_url',(u,m,ch,uid,now,result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,guild_id))
+    def get_monitor(self, u, guild_id=None):
+        monitors = self.get_monitors(guild_id)
+        return next((monitor for monitor in monitors if monitor.username == u), None)
+
     def stop_monitor(self,u,guild_id=None):
         with self._connect() as c:
             if guild_id is None: return c.execute('DELETE FROM monitors WHERE username=?',(u,)).rowcount>0
@@ -52,15 +56,35 @@ class Database:
     def get_monitors(self,guild_id=None):
         with self._connect() as c:
             rows = c.execute('SELECT * FROM monitors '+('WHERE guild_id=? ' if guild_id is not None else '')+'ORDER BY started_at', (guild_id,) if guild_id is not None else ()).fetchall()
-        return [Monitor(r['username'],r['mode'],r['channel_id'],r['user_id'],r['guild_id'],datetime.fromisoformat(r['started_at']),AccountState(r['last_state']),r['followers'] or 0,r['following'] or 0,r['posts'] or 0) for r in rows]
+        return [Monitor(r['username'],r['mode'],r['channel_id'],r['user_id'],r['guild_id'],datetime.fromisoformat(r['started_at']),AccountState(r['last_state']),r['followers'] or 0,r['following'] or 0,r['posts'] or 0,datetime.fromisoformat(r['last_checked']) if r['last_checked'] else None,r['profile_pic_url']) for r in rows]
     def update_last_check(self,u,result,guild_id=None):
         now=datetime.now(timezone.utc).isoformat(); p=result.profile
         with self._connect() as c:
             c.execute('UPDATE monitors SET last_state=?,last_checked=?,followers=?,following=?,posts=?,profile_pic_url=? WHERE username=?'+(' AND guild_id=?' if guild_id is not None else ''),(result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u,guild_id) if guild_id is not None else (result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u))
     def add_history(self,u,e,started,p,guild_id=None):
         with self._connect() as c: c.execute('INSERT INTO history(username,event,detected_at,elapsed_seconds,followers,following,posts,guild_id) VALUES (?,?,?,?,?,?,?,?)',(u,e,datetime.now(timezone.utc).isoformat(),int((datetime.now(timezone.utc)-started).total_seconds()),p.followers if p else 0,p.following if p else 0,p.posts if p else 0,guild_id))
-    def get_history(self,limit=10,guild_id=None):
-        with self._connect() as c: return c.execute('SELECT * FROM history '+('WHERE guild_id=? ' if guild_id else '')+'ORDER BY id DESC LIMIT ?',((guild_id,limit) if guild_id else (limit,))).fetchall()
+    def get_history(self,limit=10,guild_id=None,username=None,oldest_first=False):
+        filters = []
+        params = []
+        if guild_id is not None:
+            filters.append('guild_id=?'); params.append(guild_id)
+        if username:
+            filters.append('username=?'); params.append(username)
+        where = (' WHERE ' + ' AND '.join(filters)) if filters else ''
+        order = 'ASC' if oldest_first else 'DESC'
+        params.append(limit)
+        with self._connect() as c:
+            return c.execute(f'SELECT * FROM history{where} ORDER BY id {order} LIMIT ?', tuple(params)).fetchall()
+
+    def get_statistics(self, guild_id=None):
+        monitor_filter = ' WHERE guild_id=?' if guild_id is not None else ''
+        history_filter = ' WHERE guild_id=?' if guild_id is not None else ''
+        with self._connect() as c:
+            monitor_params = (guild_id,) if guild_id is not None else ()
+            history_params = (guild_id,) if guild_id is not None else ()
+            totals = c.execute(f'SELECT COUNT(*) AS monitored, COALESCE(SUM(followers), 0) AS followers, SUM(CASE WHEN last_state=? THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN last_state=? THEN 1 ELSE 0 END) AS unavailable FROM monitors{monitor_filter}', (AccountState.ACTIVE.value, AccountState.UNAVAILABLE.value, *monitor_params)).fetchone()
+            changes = c.execute(f'SELECT COALESCE(SUM(CASE WHEN event=? THEN 1 ELSE 0 END), 0) AS unavailable_events, COALESCE(SUM(CASE WHEN event=? THEN 1 ELSE 0 END), 0) AS recovered_events FROM history{history_filter}', ('banned', 'recovered', *history_params)).fetchone()
+        return {**dict(totals), **dict(changes)}
     def get_config(self,gid):
         with self._connect() as c: r=c.execute('SELECT * FROM alert_configs WHERE guild_id=?',(gid,)).fetchone()
         if not r:return AlertConfig(gid)

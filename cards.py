@@ -70,6 +70,12 @@ def create_profile_card(profile, username, unavailable=False):
         draw.text((345, 250), "UserNotFound", fill=gray, font=_font(22))
     else:
         draw.text((345, 250), f"@{username}", fill=gray, font=_font(22))
+        caption = getattr(profile, "latest_post_caption", None)
+        post_date = getattr(profile, "latest_post_date", None)
+        if caption or post_date:
+            draw.text((345, 300), "Latest post", fill=white, font=_font(20, True))
+            post_text = (caption or "No caption").replace("\n", " ")[:58]
+            draw.text((345, 330), post_text, fill=gray, font=_font(18))
 
     out = Path(tempfile.gettempdir()) / f"homelander_{username}.png"
     bg.save(out, "PNG")
