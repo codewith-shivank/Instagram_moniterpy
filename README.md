@@ -125,6 +125,10 @@ docker run --env-file .env -v instagram-monitor-data:/app instagram-monitor
 
 Configure `DISCORD_TOKEN` and the other environment variables in the host's secret/environment settings. Do not commit `.env` or `monitor.db`.
 
+### Render
+
+The included `render.yaml` defines a Docker background worker with a persistent disk for SQLite. In Render, choose **New → Blueprint**, connect this repository, and apply the blueprint. Set `DISCORD_TOKEN` and `DISCORD_GUILD_ID` when prompted. The service uses Render's Starter worker plan because background workers and persistent disks are not available on the free web-service plan.
+
 ## GitHub
 
 Do NOT commit:

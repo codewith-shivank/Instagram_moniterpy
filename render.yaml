@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: instagram-monitor-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    disk:
+      name: instagram-monitor-data
+      mountPath: /var/lib/instagram-monitor
+      sizeGB: 1
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: CHECK_INTERVAL_SECONDS
+        value: "120"
+      - key: CONFIRMATION_CHECKS
+        value: "2"
+      - key: STATE_FILE
+        value: /var/lib/instagram-monitor/monitor.db
+      - key: INSTAGRAM_SESSIONID
+        sync: false
