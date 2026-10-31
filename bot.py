@@ -52,6 +52,25 @@ def clean_username(value: str) -> str:
     value = value.lstrip("@").strip()
     return value.lower()
 
+async def defer_interaction(interaction: discord.Interaction, *, ephemeral: bool = False) -> None:
+    """Acknowledge an interaction once, before any potentially slow work."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+
+async def reply(interaction: discord.Interaction, *args, **kwargs):
+    """Send exactly one response, using a follow-up after defer()."""
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
+
+async def command_error_reply(interaction: discord.Interaction, command_name: str):
+    log.exception("/%s failed", command_name)
+    message = "⚠️ Something went wrong while processing that command. Please try again."
+    try:
+        await reply(interaction, message, ephemeral=True)
+    except discord.HTTPException:
+        log.exception("Could not send error response for /%s", command_name)
+
 async def fetch_confirmed(username: str, expected: AccountState | None = None):
     """Require repeated identical results to reduce false ban/recovery alerts."""
     last = None
@@ -145,6 +164,24 @@ async def on_ready():
     if not summary_loop.is_running():
         summary_loop.start()
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    command_name = interaction.command.name if interaction.command else "unknown"
+    if isinstance(error, app_commands.CommandNotFound):
+        log.warning("Ignoring stale slash command registration: /%s", command_name)
+    elif isinstance(error, app_commands.MissingPermissions):
+        log.warning("Permission denied for /%s: %s", command_name, error)
+        try:
+            await reply(interaction, "⚠️ You do not have permission to use this command.", ephemeral=True)
+        except discord.HTTPException:
+            log.exception("Could not send permission error for /%s", command_name)
+    else:
+        log.error("Unhandled application command error for /%s", command_name, exc_info=error)
+        try:
+            await reply(interaction, "⚠️ The command could not be completed. Please try again.", ephemeral=True)
+        except discord.HTTPException:
+            log.exception("Could not send command error for /%s", command_name)
+
 @bot.tree.command(name="ban", description="Monitor an active Instagram account until it becomes unavailable.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def ban(interaction: discord.Interaction, username: str):
@@ -152,9 +189,12 @@ async def ban(interaction: discord.Interaction, username: str):
     if not username:
         return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
 
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         result = await checker.check(username)
+    except asyncio.TimeoutError:
+        log.exception("/ban Instagram API timeout for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
     except Exception:
         log.exception("/ban check failed for @%s", username)
         return await interaction.followup.send("⚠️ Instagram could not be checked right now. Please try again later.")
@@ -181,8 +221,15 @@ async def unban(interaction: discord.Interaction, username: str):
     if not username:
         return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
 
-    await interaction.response.defer()
-    result = await checker.check(username)
+    await interaction.response.defer(thinking=True)
+    try:
+        result = await checker.check(username)
+    except asyncio.TimeoutError:
+        log.exception("/unban Instagram API timeout for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
+    except Exception:
+        log.exception("/unban check failed for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram could not be checked right now. Please try again later.")
     if result.state == AccountState.UNKNOWN:
         return await interaction.followup.send(embed=base_embed(f"Unable to verify • @{short_username(username)}", "Instagram did not provide a reliable answer. This does not confirm a ban or deletion.", "neutral"))
     if result.state == AccountState.ACTIVE:
@@ -198,19 +245,21 @@ async def unban(interaction: discord.Interaction, username: str):
 @bot.tree.command(name="stop", description="Stop monitoring an Instagram account.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def stop(interaction: discord.Interaction, username: str):
+    await defer_interaction(interaction, ephemeral=True)
     username = clean_username(username)
     removed = db.stop_monitor(username, interaction.guild_id)
     if not removed:
-        return await interaction.response.send_message(embed=empty_embed("Monitor not found", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
+        return await interaction.followup.send(embed=empty_embed("Monitor not found", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
     embed = base_embed(f"Monitoring stopped • @{short_username(username)}", "No further automatic transition alerts will be sent.", "changed")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="list", description="List all active Instagram monitors.")
 async def list_monitors(interaction: discord.Interaction):
+    await defer_interaction(interaction)
     try:
         monitors = db.get_monitors(interaction.guild_id)
         if not monitors:
-            return await interaction.response.send_message(embed=empty_embed("No active monitors", "Use `/ban` or `/unban` to start watching an account."))
+            return await interaction.followup.send(embed=empty_embed("No active monitors", "Use `/ban` or `/unban` to start watching an account."))
 
         rows = []
         for monitor in monitors:
@@ -219,7 +268,7 @@ async def list_monitors(interaction: discord.Interaction):
             rows.append(f"**[@{short_username(monitor.username)}]({account_url(monitor.username)})**\n`{status_text(monitor.last_state.value)}` • `{watch}`\nFollowers: **{monitor.followers:,}** • Checked: {checked}")
         pages = paged_embeds(f"Active monitors • {len(monitors)} account(s)", rows, status="monitoring")
         view = PageView(pages) if len(pages) > 1 else None
-        await interaction.response.send_message(embed=pages[0], view=view)
+        await interaction.followup.send(embed=pages[0], view=view)
         if view:
             view.message = await interaction.original_response()
     except Exception:
@@ -228,31 +277,37 @@ async def list_monitors(interaction: discord.Interaction):
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.followup.send(message, ephemeral=True)
 
 @bot.tree.command(name="alert-channel", description="Add or remove an alert destination channel.")
 @app_commands.describe(action="add or remove", channel="Channel to receive alerts")
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove")])
 @app_commands.checks.has_permissions(manage_guild=True)
 async def alert_channel(interaction: discord.Interaction, action: app_commands.Choice[str], channel: discord.TextChannel):
-    if action.value == "add": db.add_destination(interaction.guild_id, channel.id)
-    else: db.remove_destination(interaction.guild_id, channel.id)
+    await defer_interaction(interaction, ephemeral=True)
+    try:
+        if action.value == "add": db.add_destination(interaction.guild_id, channel.id)
+        else: db.remove_destination(interaction.guild_id, channel.id)
+    except Exception:
+        log.exception("/alert-channel failed")
+        return await interaction.followup.send("⚠️ I couldn't update the alert destination.", ephemeral=True)
     embed = base_embed("Alert destination updated", f"{channel.mention} is now {'included in' if action.value == 'add' else 'removed from'} automatic alerts.", "changed")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="alert-config", description="Configure alert style, cooldown, roles, summaries, webhooks and DMs.")
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(style="embed or plain", cooldown="Cooldown seconds", roles="Comma-separated role IDs", everyone="Allow @everyone", dm="DM monitor owner", webhook="Webhook URL", summary="off, daily or weekly")
 async def alert_config(interaction: discord.Interaction, style: str="embed", cooldown: int=0, roles: str="", everyone: bool=False, dm: bool=False, webhook: str="", summary: str="off"):
+    await defer_interaction(interaction, ephemeral=True)
     if style not in ("embed", "plain") or summary not in ("off", "daily", "weekly") or cooldown < 0:
-        return await interaction.response.send_message("Invalid style, summary, or cooldown.", ephemeral=True)
+        return await interaction.followup.send("Invalid style, summary, or cooldown.", ephemeral=True)
     if everyone and not interaction.channel.permissions_for(interaction.user).mention_everyone:
-        return await interaction.response.send_message("You need the Mention Everyone permission to enable @everyone alerts.", ephemeral=True)
+        return await interaction.followup.send("You need the Mention Everyone permission to enable @everyone alerts.", ephemeral=True)
     role_ids = tuple(int(x.strip()) for x in roles.split(",") if x.strip().isdigit())
     if role_ids:
         missing = [role_id for role_id in role_ids if interaction.guild.get_role(role_id) is None]
         if missing:
-            return await interaction.response.send_message(f"Unknown role ID(s): {', '.join(map(str, missing))}", ephemeral=True)
+            return await interaction.followup.send(f"Unknown role ID(s): {', '.join(map(str, missing))}", ephemeral=True)
     cfg = AlertConfig(interaction.guild_id, style, cooldown, role_ids, everyone, dm, webhook or None, summary, interaction.channel_id if summary != "off" else None)
     db.save_config(cfg)
     embed = base_embed("Alert configuration saved", "Future automatic notifications will use these settings.", "changed")
@@ -260,16 +315,17 @@ async def alert_config(interaction: discord.Interaction, style: str="embed", coo
     embed.add_field(name="Cooldown", value=f"{cooldown}s", inline=True)
     embed.add_field(name="Summary", value=f"`{summary.upper()}`", inline=True)
     embed.add_field(name="Mentions", value="Everyone enabled" if everyone else "Role mentions only", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="history", description="Show recent monitoring events.")
 @app_commands.describe(limit="Number of events to show (1-20)", username="Optional account filter", oldest_first="Show oldest events first")
 async def history(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10, username: str = "", oldest_first: bool = False):
+    await defer_interaction(interaction)
     try:
         username = clean_username(username) if username else None
         rows = db.get_history(int(limit), interaction.guild_id, username, oldest_first)
         if not rows:
-            return await interaction.response.send_message(embed=empty_embed("No monitoring history", "Confirmed account status changes will appear here after monitoring begins."))
+            return await interaction.followup.send(embed=empty_embed("No monitoring history", "Confirmed account status changes will appear here after monitoring begins."))
 
         lines = []
         for row in rows:
@@ -278,7 +334,7 @@ async def history(interaction: discord.Interaction, limit: app_commands.Range[in
             lines.append(f"**@{short_username(row['username'])}** • `{status}`\n{format_timestamp(row['detected_at'])} • {details} • monitored {elapsed_text(row['elapsed_seconds'])}")
         pages = paged_embeds("Status history", lines, page_size=5, status="changed")
         view = PageView(pages) if len(pages) > 1 else None
-        await interaction.response.send_message(embed=pages[0], view=view)
+        await interaction.followup.send(embed=pages[0], view=view)
         if view:
             view.message = await interaction.original_response()
     except Exception:
@@ -291,8 +347,12 @@ async def history(interaction: discord.Interaction, limit: app_commands.Range[in
 
 @bot.tree.command(name="dashboard", description="Open the monitoring dashboard.")
 async def dashboard(interaction: discord.Interaction):
-    monitors = db.get_monitors(interaction.guild_id)
-    stats = db.get_statistics(interaction.guild_id)
+    await defer_interaction(interaction)
+    try:
+        monitors = db.get_monitors(interaction.guild_id)
+        stats = db.get_statistics(interaction.guild_id)
+    except Exception:
+        return await command_error_reply(interaction, "dashboard")
     embed = base_embed("Instagram Monitor Dashboard", "A quick view of monitoring, account health, and recent activity.", "monitoring")
     embed.add_field(name="Accounts monitored", value=str(stats["monitored"]), inline=True)
     embed.add_field(name="Active", value=str(stats["active"] or 0), inline=True)
@@ -301,18 +361,19 @@ async def dashboard(interaction: discord.Interaction):
     embed.add_field(name="Confirmed unavailable events", value=str(stats["unavailable_events"]), inline=True)
     embed.add_field(name="Confirmed recovery events", value=str(stats["recovered_events"]), inline=True)
     embed.add_field(name="Navigation", value="Use `/list` for accounts, `/status` for details, and `/history` for activity.", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="account", description="Show the saved monitoring details for an account.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def account(interaction: discord.Interaction, username: str):
+    await defer_interaction(interaction, ephemeral=True)
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
+        return await interaction.followup.send(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
     monitor = db.get_monitor(username, interaction.guild_id)
     if not monitor:
-        return await interaction.response.send_message(embed=empty_embed("Account not monitored", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
+        return await interaction.followup.send(embed=empty_embed("Account not monitored", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
     embed = base_embed(f"Account details • @{short_username(username)}", f"[Open Instagram profile]({account_url(username)})", monitor.last_state.value)
     embed.add_field(name="Status", value=f"`{status_text(monitor.last_state.value)}`", inline=True)
     embed.add_field(name="Followers", value=f"{monitor.followers:,}", inline=True)
@@ -321,7 +382,7 @@ async def account(interaction: discord.Interaction, username: str):
     embed.add_field(name="Last checked", value=format_timestamp(monitor.last_checked), inline=False)
     if monitor.profile_pic_url:
         embed.set_thumbnail(url=monitor.profile_pic_url)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="status", description="Check the current status of an Instagram account.")
@@ -330,8 +391,15 @@ async def status(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
         return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
-    await interaction.response.defer()
-    result = await checker.check(username)
+    await interaction.response.defer(thinking=True)
+    try:
+        result = await checker.check(username)
+    except asyncio.TimeoutError:
+        log.exception("/status Instagram API timeout for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
+    except Exception:
+        log.exception("/status check failed for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram could not be checked right now. Please try again later.")
     if result.state == AccountState.UNKNOWN:
         return await interaction.followup.send(embed=base_embed(f"Account status • @{short_username(username)}", "Instagram did not provide a reliable answer. This does not confirm a ban or deletion. Try again later.", "neutral"))
     profile = result.profile
