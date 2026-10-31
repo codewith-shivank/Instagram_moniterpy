@@ -157,6 +157,7 @@ Increase:
 ```env
 CONFIRMATION_CHECKS=3
 CHECK_INTERVAL_SECONDS=180
+INSTAGRAM_CHECK_TIMEOUT_SECONDS=25
 ```
 
 A shorter interval increases requests and may increase rate limiting.

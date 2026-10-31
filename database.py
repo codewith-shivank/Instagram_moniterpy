@@ -1,5 +1,6 @@
 ﻿import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from instagram import AccountState
@@ -13,27 +14,49 @@ class AlertConfig:
     guild_id: int; style: str='embed'; cooldown_seconds: int=0; role_ids: tuple[int,...]=(); everyone: bool=False; dm_alerts: bool=False; webhook_url: str|None=None; summary_frequency: str='off'; summary_channel_id: int|None=None; last_summary_at: datetime|None=None
 class Database:
     def __init__(self,path): self.path=path; self._init()
+    @contextmanager
     def _connect(self):
-        c=sqlite3.connect(self.path); c.row_factory=sqlite3.Row; return c
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
     def _init(self):
         with self._connect() as c:
-            c.execute('CREATE TABLE IF NOT EXISTS monitors (username TEXT PRIMARY KEY,mode TEXT NOT NULL,channel_id INTEGER NOT NULL,user_id INTEGER NOT NULL,started_at TEXT NOT NULL,last_state TEXT NOT NULL,last_checked TEXT NOT NULL,followers INTEGER DEFAULT 0,following INTEGER DEFAULT 0,posts INTEGER DEFAULT 0,profile_pic_url TEXT,guild_id INTEGER)')
+            c.execute('CREATE TABLE IF NOT EXISTS monitors (username TEXT NOT NULL,mode TEXT NOT NULL,channel_id INTEGER NOT NULL,user_id INTEGER NOT NULL,started_at TEXT NOT NULL,last_state TEXT NOT NULL,last_checked TEXT NOT NULL,followers INTEGER DEFAULT 0,following INTEGER DEFAULT 0,posts INTEGER DEFAULT 0,profile_pic_url TEXT,guild_id INTEGER,PRIMARY KEY(username,guild_id))')
+            columns = {r[1] for r in c.execute('PRAGMA table_info(monitors)')}
+            # Older releases used username as the only key, which caused one server\'s monitor to replace another\'s.
+            monitor_info = list(c.execute('PRAGMA table_info(monitors)'))
+            primary_key_columns = [r[1] for r in monitor_info if r[5] > 0]
+            if primary_key_columns == ['username'] and 'guild_id' in columns:
+                c.execute('ALTER TABLE monitors RENAME TO monitors_legacy')
+                c.execute('CREATE TABLE monitors (username TEXT NOT NULL,mode TEXT NOT NULL,channel_id INTEGER NOT NULL,user_id INTEGER NOT NULL,started_at TEXT NOT NULL,last_state TEXT NOT NULL,last_checked TEXT NOT NULL,followers INTEGER DEFAULT 0,following INTEGER DEFAULT 0,posts INTEGER DEFAULT 0,profile_pic_url TEXT,guild_id INTEGER,PRIMARY KEY(username,guild_id))')
+                c.execute('INSERT OR IGNORE INTO monitors SELECT username,mode,channel_id,user_id,started_at,last_state,last_checked,followers,following,posts,profile_pic_url,guild_id FROM monitors_legacy')
+                c.execute('DROP TABLE monitors_legacy')
             c.execute('CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,event TEXT NOT NULL,detected_at TEXT NOT NULL,elapsed_seconds INTEGER NOT NULL,followers INTEGER DEFAULT 0,following INTEGER DEFAULT 0,posts INTEGER DEFAULT 0,guild_id INTEGER)')
             c.execute("CREATE TABLE IF NOT EXISTS alert_configs (guild_id INTEGER PRIMARY KEY,style TEXT NOT NULL DEFAULT 'embed',cooldown_seconds INTEGER NOT NULL DEFAULT 0,role_ids TEXT NOT NULL DEFAULT '[]',everyone INTEGER NOT NULL DEFAULT 0,dm_alerts INTEGER NOT NULL DEFAULT 0,webhook_url TEXT,summary_frequency TEXT NOT NULL DEFAULT 'off',summary_channel_id INTEGER,last_summary_at TEXT)")
             c.execute('CREATE TABLE IF NOT EXISTS alert_destinations (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,PRIMARY KEY(guild_id,channel_id))')
-            for table,column in [('monitors','guild_id'),('history','guild_id')]:
-                if column not in {r[1] for r in c.execute(f'PRAGMA table_info({table})')}: c.execute(f'ALTER TABLE {table} ADD COLUMN {column} INTEGER')
+            if 'guild_id' not in {r[1] for r in c.execute('PRAGMA table_info(history)')}: c.execute('ALTER TABLE history ADD COLUMN guild_id INTEGER')
     def add_monitor(self,u,m,ch,uid,result,guild_id=None):
         now=datetime.now(timezone.utc).isoformat(); p=result.profile
-        with self._connect() as c: c.execute('INSERT OR REPLACE INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',(u,m,ch,uid,now,result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,guild_id))
-    def stop_monitor(self,u):
-        with self._connect() as c: return c.execute('DELETE FROM monitors WHERE username=?',(u,)).rowcount>0
-    def get_monitors(self):
-        with self._connect() as c: rows=c.execute('SELECT * FROM monitors ORDER BY started_at').fetchall()
+        with self._connect() as c: c.execute('INSERT INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(username,guild_id) DO UPDATE SET mode=excluded.mode,channel_id=excluded.channel_id,user_id=excluded.user_id,started_at=excluded.started_at,last_state=excluded.last_state,last_checked=excluded.last_checked,followers=excluded.followers,following=excluded.following,posts=excluded.posts,profile_pic_url=excluded.profile_pic_url',(u,m,ch,uid,now,result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,guild_id))
+    def stop_monitor(self,u,guild_id=None):
+        with self._connect() as c:
+            if guild_id is None: return c.execute('DELETE FROM monitors WHERE username=?',(u,)).rowcount>0
+            return c.execute('DELETE FROM monitors WHERE username=? AND guild_id=?',(u,guild_id)).rowcount>0
+    def get_monitors(self,guild_id=None):
+        with self._connect() as c:
+            rows = c.execute('SELECT * FROM monitors '+('WHERE guild_id=? ' if guild_id is not None else '')+'ORDER BY started_at', (guild_id,) if guild_id is not None else ()).fetchall()
         return [Monitor(r['username'],r['mode'],r['channel_id'],r['user_id'],r['guild_id'],datetime.fromisoformat(r['started_at']),AccountState(r['last_state']),r['followers'] or 0,r['following'] or 0,r['posts'] or 0) for r in rows]
-    def update_last_check(self,u,result):
+    def update_last_check(self,u,result,guild_id=None):
         now=datetime.now(timezone.utc).isoformat(); p=result.profile
-        with self._connect() as c: c.execute('UPDATE monitors SET last_state=?,last_checked=?,followers=?,following=?,posts=?,profile_pic_url=? WHERE username=?',(result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u))
+        with self._connect() as c:
+            c.execute('UPDATE monitors SET last_state=?,last_checked=?,followers=?,following=?,posts=?,profile_pic_url=? WHERE username=?'+(' AND guild_id=?' if guild_id is not None else ''),(result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u,guild_id) if guild_id is not None else (result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u))
     def add_history(self,u,e,started,p,guild_id=None):
         with self._connect() as c: c.execute('INSERT INTO history(username,event,detected_at,elapsed_seconds,followers,following,posts,guild_id) VALUES (?,?,?,?,?,?,?,?)',(u,e,datetime.now(timezone.utc).isoformat(),int((datetime.now(timezone.utc)-started).total_seconds()),p.followers if p else 0,p.following if p else 0,p.posts if p else 0,guild_id))
     def get_history(self,limit=10,guild_id=None):

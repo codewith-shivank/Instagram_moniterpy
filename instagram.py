@@ -37,6 +37,8 @@ def compact_number(value: int) -> str:
 
 class InstagramChecker:
     def __init__(self):
+        self.timeout_seconds = max(5, int(os.getenv("INSTAGRAM_CHECK_TIMEOUT_SECONDS", "25")))
+        self._lock = asyncio.Lock()
         self.loader = instaloader.Instaloader(
             download_pictures=False,
             download_videos=False,
@@ -80,9 +82,22 @@ class InstagramChecker:
             return AccountState.UNKNOWN, None
 
     async def check(self, username: str):
-        state, profile = await asyncio.to_thread(self._check_sync, username)
         class Result:
-            pass
+            state = AccountState.UNKNOWN
+            profile = None
+
+        try:
+            # Instaloader's session is shared, so serialize requests to avoid
+            # corrupting the session when several Discord users use /ban.
+            async with self._lock:
+                state, profile = await asyncio.wait_for(
+                    asyncio.to_thread(self._check_sync, username),
+                    timeout=self.timeout_seconds,
+                )
+        except asyncio.TimeoutError:
+            return Result()
+        except Exception:
+            return Result()
         result = Result()
         result.state = state
         result.profile = profile

@@ -55,9 +55,12 @@ async def fetch_confirmed(username: str, expected: AccountState | None = None):
     """Require repeated identical results to reduce false ban/recovery alerts."""
     last = None
     stable = 0
+    result = None
     for _ in range(CONFIRMATION_CHECKS):
         result = await checker.check(username)
         if result.state == AccountState.UNKNOWN:
+            return result
+        if expected is not None and result.state != expected:
             return result
         if last == result.state:
             stable += 1
@@ -145,7 +148,11 @@ async def ban(interaction: discord.Interaction, username: str):
         return await interaction.response.send_message("❌ Invalid Instagram username.", ephemeral=True)
 
     await interaction.response.defer()
-    result = await checker.check(username)
+    try:
+        result = await checker.check(username)
+    except Exception:
+        log.exception("/ban check failed for @%s", username)
+        return await interaction.followup.send("⚠️ Instagram could not be checked right now. Please try again later.")
     if result.state == AccountState.UNKNOWN:
         return await interaction.followup.send(
             f"⚠️ I couldn't verify @{username} right now. Try again in a moment."
@@ -191,16 +198,16 @@ async def unban(interaction: discord.Interaction, username: str):
 @app_commands.describe(username="Instagram username or profile URL")
 async def stop(interaction: discord.Interaction, username: str):
     username = clean_username(username)
-    removed = db.stop_monitor(username)
+    removed = db.stop_monitor(username, interaction.guild_id)
     if not removed:
         return await interaction.response.send_message(
-            f"⚠️ @{username} is not currently being monitored.", ephemeral=True
+            f"⚠️ @{username} is not currently being monitored in this server.", ephemeral=True
         )
-    await interaction.response.send_message(f"🛑 Stopped monitoring **@{username}**.")
+    await interaction.response.send_message(f"🛑 Stopped monitoring **@{username}** in this server.")
 
 @bot.tree.command(name="list", description="List all active Instagram monitors.")
 async def list_monitors(interaction: discord.Interaction):
-    monitors = db.get_monitors()
+    monitors = db.get_monitors(interaction.guild_id)
     if not monitors:
         return await interaction.response.send_message("📱 No active monitors.")
 
@@ -245,7 +252,7 @@ async def alert_config(interaction: discord.Interaction, style: str="embed", coo
 @bot.tree.command(name="history", description="Show recent monitoring events.")
 @app_commands.describe(limit="Number of events to show (1-20)")
 async def history(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10):
-    rows = db.get_history(limit)
+    rows = db.get_history(limit, interaction.guild_id)
     if not rows:
         return await interaction.response.send_message("📜 No monitoring history yet.")
     lines = ["📜 **Monitoring History**", ""]
@@ -312,11 +319,11 @@ async def monitor_loop():
                 continue
 
             previous = monitor.last_state
-            db.update_last_check(monitor.username, result)
+            db.update_last_check(monitor.username, result, monitor.guild_id)
 
             if monitor.mode == "ban" and previous == AccountState.ACTIVE and result.state == AccountState.UNAVAILABLE:
                 # Confirm transition before alerting.
-                confirmed = await fetch_confirmed(monitor.username)
+                confirmed = await fetch_confirmed(monitor.username, AccountState.UNAVAILABLE)
                 if confirmed.state != AccountState.UNAVAILABLE:
                     continue
                 cfg = db.get_config(monitor.guild_id) if monitor.guild_id else AlertConfig(0)
@@ -331,10 +338,10 @@ async def monitor_loop():
                     try: await (await bot.fetch_user(monitor.user_id)).send(f"Instagram alert: @{monitor.username} was unavailable.")
                     except Exception: log.exception("DM alert failed")
                 db.add_history(monitor.username, "banned", monitor.started_at, confirmed.profile, monitor.guild_id)
-                db.stop_monitor(monitor.username)
+                db.stop_monitor(monitor.username, monitor.guild_id)
 
             elif monitor.mode == "unban" and previous == AccountState.UNAVAILABLE and result.state == AccountState.ACTIVE:
-                confirmed = await fetch_confirmed(monitor.username)
+                confirmed = await fetch_confirmed(monitor.username, AccountState.ACTIVE)
                 if confirmed.state != AccountState.ACTIVE:
                     continue
                 cfg = db.get_config(monitor.guild_id) if monitor.guild_id else AlertConfig(0)
@@ -349,7 +356,7 @@ async def monitor_loop():
                     try: await (await bot.fetch_user(monitor.user_id)).send(f"Instagram alert: @{monitor.username} recovered.")
                     except Exception: log.exception("DM alert failed")
                 db.add_history(monitor.username, "recovered", monitor.started_at, confirmed.profile, monitor.guild_id)
-                db.stop_monitor(monitor.username)
+                db.stop_monitor(monitor.username, monitor.guild_id)
         except Exception:
             log.exception("Monitor error for @%s", monitor.username)
 
