@@ -1,25 +1,39 @@
-import os
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-import aiohttp
+import os
+import sqlite3
+from datetime import UTC, datetime, timedelta
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from database import Database, AlertConfig
-from instagram import InstagramChecker, AccountState
 from cards import create_profile_card
-from ui import account_url, base_embed, empty_embed, error_embed, format_timestamp, paged_embeds, short_username, status_text, PageView
+from database import AlertConfig, Database
+from instagram import AccountState, InstagramChecker
+from ui import (
+    PageView,
+    account_url,
+    base_embed,
+    empty_embed,
+    error_embed,
+    format_timestamp,
+    paged_embeds,
+    short_username,
+    status_text,
+)
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "120")))
 CONFIRMATION_CHECKS = max(1, int(os.getenv("CONFIRMATION_CHECKS", "2")))
+COMMAND_SYNC_RETRIES = 3
+RECONNECT_MIN_SECONDS = 5
+RECONNECT_MAX_SECONDS = 60
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
@@ -31,12 +45,21 @@ logging.basicConfig(
 log = logging.getLogger("shivannnkk-instagram-monitor")
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+class MonitorBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await sync_commands()
+
+
+bot = MonitorBot(command_prefix="!", intents=intents)
 db = Database(os.getenv("STATE_FILE", "monitor.db"))
 checker = InstagramChecker()
+command_sync_lock = asyncio.Lock()
+connection_ready = asyncio.Event()
 
 def utcnow():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 def elapsed_text(seconds: int) -> str:
     seconds = max(0, int(seconds))
@@ -64,7 +87,7 @@ async def reply(interaction: discord.Interaction, *args, **kwargs):
     return await interaction.response.send_message(*args, **kwargs)
 
 async def command_error_reply(interaction: discord.Interaction, command_name: str):
-    log.exception("/%s failed", command_name)
+    log.error("/%s failed", command_name)
     message = "⚠️ Something went wrong while processing that command. Please try again."
     try:
         await reply(interaction, message, ephemeral=True)
@@ -98,13 +121,16 @@ async def send_event(channel: discord.abc.Messageable, monitor, event: str, prof
     status = "unavailable" if unavailable else "active"
     title = f"Account {status_text(status).title()} • @{short_username(monitor.username)}"
     followers = profile.followers_display if profile else (f"{monitor.followers:,}" if unavailable else "Unknown")
-    embed = base_embed(title, f"The latest confirmed check reports this account as **{status_text(status)}**.", status)
+    embed = base_embed(
+        title,
+        f"The latest confirmed check reports this account as **{status_text(status)}**.",
+        status,
+    )
     embed.add_field(name="Status", value=f"`{status_text(status)}`", inline=True)
     embed.add_field(name="Followers", value=followers, inline=True)
     embed.add_field(name="Monitoring duration", value=elapsed, inline=True)
     embed.add_field(name="Detected", value=format_timestamp(utcnow()), inline=False)
-    if config.style == "plain":
-        embed = None
+    message_embed: discord.Embed | None = None if config.style == "plain" else embed
     mention = ""
     if config.everyone:
         mention += "@everyone "
@@ -126,39 +152,80 @@ async def send_event(channel: discord.abc.Messageable, monitor, event: str, prof
         card_path = create_profile_card(profile, monitor.username, unavailable=(event == "banned"))
         if card_path:
             file = discord.File(card_path, filename="instagram-profile.png")
-            if embed:
-                embed.set_image(url="attachment://instagram-profile.png")
-            await channel.send(content=(mention + title) if embed is None else (mention or None), embed=embed, file=file, allowed_mentions=allowed)
+            if message_embed:
+                message_embed.set_image(url="attachment://instagram-profile.png")
+            if message_embed:
+                await channel.send(content=mention or None, embed=message_embed, file=file, allowed_mentions=allowed)
+            else:
+                await channel.send(content=mention + title, file=file, allowed_mentions=allowed)
         else:
-            await channel.send(content=(mention + title) if embed is None else (mention or None), embed=embed, allowed_mentions=allowed)
+            if message_embed:
+                await channel.send(content=mention or None, embed=message_embed, allowed_mentions=allowed)
+            else:
+                await channel.send(content=mention + title, allowed_mentions=allowed)
     except Exception:
         log.exception("Failed to create/send profile card")
-        await channel.send(content=mention + title, embed=embed, allowed_mentions=allowed)
+        if message_embed:
+            await channel.send(content=mention + title, embed=message_embed, allowed_mentions=allowed)
+        else:
+            await channel.send(content=mention + title, allowed_mentions=allowed)
     if config.webhook_url:
         try:
             async with aiohttp.ClientSession() as session:
-                await session.post(config.webhook_url, json={"content": mention + title, "embeds": [embed.to_dict()] if embed else []}, timeout=10)
+                await session.post(
+                    config.webhook_url,
+                    json={"content": mention + title, "embeds": [message_embed.to_dict()] if message_embed else []},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
         except Exception:
             log.exception("Webhook alert failed")
+
+def is_transient_discord_error(error: BaseException) -> bool:
+    if isinstance(error, discord.LoginFailure):
+        return False
+    if isinstance(error, (aiohttp.ClientError, OSError, TimeoutError)):
+        return True
+    if isinstance(error, (discord.ConnectionClosed, discord.GatewayNotFound)):
+        return True
+    status = getattr(error, "status", 0)
+    return isinstance(error, discord.HTTPException) and (status == 429 or status >= 500)
+
+async def sync_commands() -> None:
+    """Replace the deployed command set with the commands currently defined here."""
+    async with command_sync_lock:
+        for attempt in range(1, COMMAND_SYNC_RETRIES + 1):
+            try:
+                if GUILD_ID:
+                    guild = discord.Object(id=int(GUILD_ID))
+                    bot.tree.clear_commands(guild=guild)
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    scope = f"guild {GUILD_ID}"
+                else:
+                    synced = await bot.tree.sync()
+                    scope = "global"
+                names = ", ".join(sorted(command.name for command in synced)) or "(none)"
+                log.info("Synced %d %s commands: %s", len(synced), scope, names)
+                return
+            except Exception as error:
+                if not is_transient_discord_error(error) or attempt == COMMAND_SYNC_RETRIES:
+                    raise
+                delay = min(
+                    RECONNECT_MAX_SECONDS,
+                    RECONNECT_MIN_SECONDS * 2 ** (attempt - 1),
+                )
+                log.warning(
+                    "Command sync attempt %d/%d failed transiently; retrying in %ss.",
+                    attempt,
+                    COMMAND_SYNC_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            # Rebuild this guild's command set from the current definitions.
-            # Clearing first removes stale remote commands such as old /ban or
-            # /unban registrations that no longer exist in the bot.
-            bot.tree.clear_commands(guild=guild)
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            log.info("Synced %d guild commands for guild %s.", len(synced), GUILD_ID)
-        else:
-            synced = await bot.tree.sync()
-            log.info("Synced %d global commands.", len(synced))
-    except Exception:
-        log.exception("Slash command sync failed")
+    connection_ready.set()
     if not monitor_loop.is_running():
         monitor_loop.start()
     if not summary_loop.is_running():
@@ -168,8 +235,20 @@ async def on_ready():
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     command_name = interaction.command.name if interaction.command else "unknown"
     if isinstance(error, app_commands.CommandNotFound):
-        log.warning("Ignoring stale slash command registration: /%s", command_name)
-    elif isinstance(error, app_commands.MissingPermissions):
+        log.warning("Received stale slash command registration: /%s", command_name)
+        try:
+            await reply(
+                interaction,
+                "⚠️ That command is no longer available. Please refresh Discord and try again.",
+                ephemeral=True,
+            )
+        except Exception as error:
+            if isinstance(error, discord.HTTPException):
+                log.warning("Could not respond to stale command /%s", command_name)
+            else:
+                log.exception("Could not respond to stale command /%s", command_name)
+        return
+    if isinstance(error, app_commands.MissingPermissions):
         log.warning("Permission denied for /%s: %s", command_name, error)
         try:
             await reply(interaction, "⚠️ You do not have permission to use this command.", ephemeral=True)
@@ -179,20 +258,27 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         log.error("Unhandled application command error for /%s", command_name, exc_info=error)
         try:
             await reply(interaction, "⚠️ The command could not be completed. Please try again.", ephemeral=True)
-        except discord.HTTPException:
-            log.exception("Could not send command error for /%s", command_name)
+        except Exception as response_error:
+            if isinstance(response_error, discord.HTTPException):
+                log.warning("Could not send command error for /%s", command_name)
+            else:
+                log.exception("Could not send command error for /%s", command_name)
 
 @bot.tree.command(name="ban", description="Monitor an active Instagram account until it becomes unavailable.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def ban(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
+        return await reply(
+            interaction,
+            embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."),
+            ephemeral=True,
+        )
 
-    await interaction.response.defer(thinking=True)
+    await defer_interaction(interaction)
     try:
         result = await checker.check(username)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.exception("/ban Instagram API timeout for @%s", username)
         return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
     except Exception:
@@ -219,12 +305,16 @@ async def ban(interaction: discord.Interaction, username: str):
 async def unban(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
+        return await reply(
+            interaction,
+            embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."),
+            ephemeral=True,
+        )
 
-    await interaction.response.defer(thinking=True)
+    await defer_interaction(interaction)
     try:
         result = await checker.check(username)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.exception("/unban Instagram API timeout for @%s", username)
         return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
     except Exception:
@@ -245,8 +335,14 @@ async def unban(interaction: discord.Interaction, username: str):
 @bot.tree.command(name="stop", description="Stop monitoring an Instagram account.")
 @app_commands.describe(username="Instagram username or profile URL")
 async def stop(interaction: discord.Interaction, username: str):
-    await defer_interaction(interaction, ephemeral=True)
     username = clean_username(username)
+    if not username:
+        return await reply(
+            interaction,
+            embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."),
+            ephemeral=True,
+        )
+    await defer_interaction(interaction, ephemeral=True)
     removed = db.stop_monitor(username, interaction.guild_id)
     if not removed:
         return await interaction.followup.send(embed=empty_embed("Monitor not found", f"`@{short_username(username)}` is not currently monitored in this server."), ephemeral=True)
@@ -259,25 +355,38 @@ async def list_monitors(interaction: discord.Interaction):
     try:
         monitors = db.get_monitors(interaction.guild_id)
         if not monitors:
-            return await interaction.followup.send(embed=empty_embed("No active monitors", "Use `/ban` or `/unban` to start watching an account."))
+            return await interaction.followup.send(
+                embed=empty_embed(
+                    "No active monitors",
+                    "Use `/ban` or `/unban` to start watching an account.",
+                )
+            )
 
         rows = []
         for monitor in monitors:
             watch = "unavailable → active" if monitor.mode == "unban" else "active → unavailable"
             checked = format_timestamp(monitor.last_checked)
-            rows.append(f"**[@{short_username(monitor.username)}]({account_url(monitor.username)})**\n`{status_text(monitor.last_state.value)}` • `{watch}`\nFollowers: **{monitor.followers:,}** • Checked: {checked}")
-        pages = paged_embeds(f"Active monitors • {len(monitors)} account(s)", rows, status="monitoring")
+            rows.append(
+                f"**[@{short_username(monitor.username)}]({account_url(monitor.username)})**\n"
+                f"`{status_text(monitor.last_state.value)}` • `{watch}`\n"
+                f"Followers: **{monitor.followers:,}** • Checked: {checked}"
+            )
+        pages = paged_embeds(
+            f"Active monitors • {len(monitors)} account(s)",
+            rows,
+            status="monitoring",
+        )
         view = PageView(pages) if len(pages) > 1 else None
-        await interaction.followup.send(embed=pages[0], view=view)
+        if view:
+            await interaction.followup.send(embed=pages[0], view=view)
+        else:
+            await interaction.followup.send(embed=pages[0])
         if view:
             view.message = await interaction.original_response()
     except Exception:
         log.exception("/list failed")
         message = "⚠️ I couldn't load the monitor list. Check the bot logs for details."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=True)
 
 @bot.tree.command(name="alert-channel", description="Add or remove an alert destination channel.")
 @app_commands.describe(action="add or remove", channel="Channel to receive alerts")
@@ -299,16 +408,21 @@ async def alert_channel(interaction: discord.Interaction, action: app_commands.C
 @app_commands.describe(style="embed or plain", cooldown="Cooldown seconds", roles="Comma-separated role IDs", everyone="Allow @everyone", dm="DM monitor owner", webhook="Webhook URL", summary="off, daily or weekly")
 async def alert_config(interaction: discord.Interaction, style: str="embed", cooldown: int=0, roles: str="", everyone: bool=False, dm: bool=False, webhook: str="", summary: str="off"):
     await defer_interaction(interaction, ephemeral=True)
+    guild = interaction.guild
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    channel = guild.get_channel(interaction.channel_id) if guild and interaction.channel_id else None
+    if not guild or member is None or channel is None:
+        return await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
     if style not in ("embed", "plain") or summary not in ("off", "daily", "weekly") or cooldown < 0:
         return await interaction.followup.send("Invalid style, summary, or cooldown.", ephemeral=True)
-    if everyone and not interaction.channel.permissions_for(interaction.user).mention_everyone:
+    if everyone and not channel.permissions_for(member).mention_everyone:
         return await interaction.followup.send("You need the Mention Everyone permission to enable @everyone alerts.", ephemeral=True)
     role_ids = tuple(int(x.strip()) for x in roles.split(",") if x.strip().isdigit())
     if role_ids:
-        missing = [role_id for role_id in role_ids if interaction.guild.get_role(role_id) is None]
+        missing = [role_id for role_id in role_ids if guild.get_role(role_id) is None]
         if missing:
             return await interaction.followup.send(f"Unknown role ID(s): {', '.join(map(str, missing))}", ephemeral=True)
-    cfg = AlertConfig(interaction.guild_id, style, cooldown, role_ids, everyone, dm, webhook or None, summary, interaction.channel_id if summary != "off" else None)
+    cfg = AlertConfig(guild.id, style, cooldown, role_ids, everyone, dm, webhook or None, summary, interaction.channel_id if summary != "off" else None)
     db.save_config(cfg)
     embed = base_embed("Alert configuration saved", "Future automatic notifications will use these settings.", "changed")
     embed.add_field(name="Style", value=f"`{style.upper()}`", inline=True)
@@ -322,8 +436,8 @@ async def alert_config(interaction: discord.Interaction, style: str="embed", coo
 async def history(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 20] = 10, username: str = "", oldest_first: bool = False):
     await defer_interaction(interaction)
     try:
-        username = clean_username(username) if username else None
-        rows = db.get_history(int(limit), interaction.guild_id, username, oldest_first)
+        username_filter: str | None = clean_username(username) if username else None
+        rows = db.get_history(int(limit), interaction.guild_id, username_filter, oldest_first)
         if not rows:
             return await interaction.followup.send(embed=empty_embed("No monitoring history", "Confirmed account status changes will appear here after monitoring begins."))
 
@@ -334,25 +448,28 @@ async def history(interaction: discord.Interaction, limit: app_commands.Range[in
             lines.append(f"**@{short_username(row['username'])}** • `{status}`\n{format_timestamp(row['detected_at'])} • {details} • monitored {elapsed_text(row['elapsed_seconds'])}")
         pages = paged_embeds("Status history", lines, page_size=5, status="changed")
         view = PageView(pages) if len(pages) > 1 else None
-        await interaction.followup.send(embed=pages[0], view=view)
+        if view:
+            await interaction.followup.send(embed=pages[0], view=view)
+        else:
+            await interaction.followup.send(embed=pages[0])
         if view:
             view.message = await interaction.original_response()
     except Exception:
         log.exception("/history failed")
         message = "⚠️ I couldn't load monitoring history. Check the bot logs for details."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=True)
 
 @bot.tree.command(name="dashboard", description="Open the monitoring dashboard.")
 async def dashboard(interaction: discord.Interaction):
     await defer_interaction(interaction)
     try:
-        monitors = db.get_monitors(interaction.guild_id)
         stats = db.get_statistics(interaction.guild_id)
-    except Exception:
-        return await command_error_reply(interaction, "dashboard")
+    except sqlite3.Error:
+        log.exception("/dashboard failed")
+        return await interaction.followup.send(
+            "⚠️ The dashboard could not be loaded. Please try again.",
+            ephemeral=True,
+        )
     embed = base_embed("Instagram Monitor Dashboard", "A quick view of monitoring, account health, and recent activity.", "monitoring")
     embed.add_field(name="Accounts monitored", value=str(stats["monitored"]), inline=True)
     embed.add_field(name="Active", value=str(stats["active"] or 0), inline=True)
@@ -390,11 +507,15 @@ async def account(interaction: discord.Interaction, username: str):
 async def status(interaction: discord.Interaction, username: str):
     username = clean_username(username)
     if not username:
-        return await interaction.response.send_message(embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."), ephemeral=True)
-    await interaction.response.defer(thinking=True)
+        return await reply(
+            interaction,
+            embed=error_embed("Invalid account", "Enter an Instagram username or profile URL."),
+            ephemeral=True,
+        )
+    await defer_interaction(interaction)
     try:
         result = await checker.check(username)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.exception("/status Instagram API timeout for @%s", username)
         return await interaction.followup.send("⚠️ Instagram took too long to respond. Please try again later.")
     except Exception:
@@ -495,4 +616,37 @@ async def monitor_loop():
 async def before_monitor_loop():
     await bot.wait_until_ready()
 
-bot.run(TOKEN)
+async def run_bot() -> None:
+    delay = RECONNECT_MIN_SECONDS
+    while True:
+        connection_ready.clear()
+        try:
+            await bot.start(TOKEN, reconnect=True)
+            log.warning("Discord connection closed; reconnecting in %ss.", delay)
+        except discord.LoginFailure:
+            log.critical(
+                "Discord rejected DISCORD_TOKEN. Replace it with a newly copied bot "
+                "token without quotes or extra whitespace."
+            )
+            raise
+        except Exception as error:
+            if not is_transient_discord_error(error):
+                raise
+            log.warning(
+                "Transient Discord connection failure (%s); reconnecting in %ss.",
+                type(error).__name__,
+                delay,
+            )
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+        if connection_ready.is_set():
+            delay = RECONNECT_MIN_SECONDS
+        await asyncio.sleep(delay)
+        delay = min(RECONNECT_MAX_SECONDS, delay * 2)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_bot())
+    except discord.LoginFailure:
+        raise SystemExit(2)

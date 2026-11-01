@@ -2,8 +2,10 @@
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 from instagram import AccountState
+
 
 @dataclass
 class Monitor:
@@ -43,7 +45,7 @@ class Database:
             c.execute('CREATE TABLE IF NOT EXISTS alert_destinations (guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,PRIMARY KEY(guild_id,channel_id))')
             if 'guild_id' not in {r[1] for r in c.execute('PRAGMA table_info(history)')}: c.execute('ALTER TABLE history ADD COLUMN guild_id INTEGER')
     def add_monitor(self,u,m,ch,uid,result,guild_id=None):
-        now=datetime.now(timezone.utc).isoformat(); p=result.profile
+        now=datetime.now(UTC).isoformat(); p=result.profile
         with self._connect() as c: c.execute('INSERT INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(username,guild_id) DO UPDATE SET mode=excluded.mode,channel_id=excluded.channel_id,user_id=excluded.user_id,started_at=excluded.started_at,last_state=excluded.last_state,last_checked=excluded.last_checked,followers=excluded.followers,following=excluded.following,posts=excluded.posts,profile_pic_url=excluded.profile_pic_url',(u,m,ch,uid,now,result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,guild_id))
     def get_monitor(self, u, guild_id=None):
         monitors = self.get_monitors(guild_id)
@@ -58,11 +60,11 @@ class Database:
             rows = c.execute('SELECT * FROM monitors '+('WHERE guild_id=? ' if guild_id is not None else '')+'ORDER BY started_at', (guild_id,) if guild_id is not None else ()).fetchall()
         return [Monitor(r['username'],r['mode'],r['channel_id'],r['user_id'],r['guild_id'],datetime.fromisoformat(r['started_at']),AccountState(r['last_state']),r['followers'] or 0,r['following'] or 0,r['posts'] or 0,datetime.fromisoformat(r['last_checked']) if r['last_checked'] else None,r['profile_pic_url']) for r in rows]
     def update_last_check(self,u,result,guild_id=None):
-        now=datetime.now(timezone.utc).isoformat(); p=result.profile
+        now=datetime.now(UTC).isoformat(); p=result.profile
         with self._connect() as c:
             c.execute('UPDATE monitors SET last_state=?,last_checked=?,followers=?,following=?,posts=?,profile_pic_url=? WHERE username=?'+(' AND guild_id=?' if guild_id is not None else ''),(result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u,guild_id) if guild_id is not None else (result.state.value,now,p.followers if p else 0,p.following if p else 0,p.posts if p else 0,p.profile_pic_url if p else None,u))
     def add_history(self,u,e,started,p,guild_id=None):
-        with self._connect() as c: c.execute('INSERT INTO history(username,event,detected_at,elapsed_seconds,followers,following,posts,guild_id) VALUES (?,?,?,?,?,?,?,?)',(u,e,datetime.now(timezone.utc).isoformat(),int((datetime.now(timezone.utc)-started).total_seconds()),p.followers if p else 0,p.following if p else 0,p.posts if p else 0,guild_id))
+        with self._connect() as c: c.execute('INSERT INTO history(username,event,detected_at,elapsed_seconds,followers,following,posts,guild_id) VALUES (?,?,?,?,?,?,?,?)',(u,e,datetime.now(UTC).isoformat(),int((datetime.now(UTC)-started).total_seconds()),p.followers if p else 0,p.following if p else 0,p.posts if p else 0,guild_id))
     def get_history(self,limit=10,guild_id=None,username=None,oldest_first=False):
         filters = []
         params = []
@@ -99,7 +101,7 @@ class Database:
         with self._connect() as c:return [r[0] for r in c.execute('SELECT channel_id FROM alert_destinations WHERE guild_id=?',(g,))]
     def recent_event(self,g,u,seconds):
         with self._connect() as c:r=c.execute('SELECT detected_at FROM history WHERE guild_id=? AND username=? ORDER BY id DESC LIMIT 1',(g,u)).fetchone()
-        return bool(r and (datetime.now(timezone.utc)-datetime.fromisoformat(r[0])).total_seconds()<seconds)
+        return bool(r and (datetime.now(UTC)-datetime.fromisoformat(r[0])).total_seconds()<seconds)
     def summary_rows(self,g,since):
         with self._connect() as c:return c.execute('SELECT * FROM history WHERE guild_id=? AND detected_at>=? ORDER BY id DESC',(g,since.isoformat())).fetchall()
     def get_summary_configs(self):

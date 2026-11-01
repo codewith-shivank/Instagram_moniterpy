@@ -1,0 +1,7 @@
+[tool.ruff]
+exclude = [".venv", ".git", "__pycache__"]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E701", "E702"]

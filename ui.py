@@ -1,11 +1,10 @@
 """Shared Discord presentation helpers for consistent, accessible bot responses."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime
 
 import discord
-
 
 BRAND = "shivannnkk"
 
@@ -46,13 +45,13 @@ def format_timestamp(value: datetime | str | None) -> str:
         except ValueError:
             return "Time unavailable"
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=UTC)
     return f"<t:{int(value.timestamp())}:f> (<t:{int(value.timestamp())}:R>)"
 
 
 def base_embed(title: str, description: str | None = None, status: str = "neutral") -> discord.Embed:
     embed = discord.Embed(title=title, description=description, color=COLORS.get(status, COLORS["neutral"]))
-    embed.set_footer(text=f"shivannnkk • Instagram Monitor • status is based on the latest verified check")
+    embed.set_footer(text="shivannnkk • Instagram Monitor • status is based on the latest verified check")
     return embed
 
 

@@ -3,9 +3,9 @@ import os
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import instaloader
+
 
 class AccountState(str, Enum):
     ACTIVE = "active"
@@ -18,10 +18,10 @@ class ProfileData:
     followers: int = 0
     following: int = 0
     posts: int = 0
-    profile_pic_url: Optional[str] = None
-    latest_post_url: Optional[str] = None
-    latest_post_caption: Optional[str] = None
-    latest_post_date: Optional[str] = None
+    profile_pic_url: str | None = None
+    latest_post_url: str | None = None
+    latest_post_caption: str | None = None
+    latest_post_date: str | None = None
 
     @property
     def followers_display(self):
@@ -119,7 +119,7 @@ class InstagramChecker:
         task.add_done_callback(self._inflight_checks.discard)
         try:
             state, profile = await asyncio.wait_for(asyncio.shield(task), timeout=self.timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if not started.is_set() and not task.done():
                 task.cancel()
                 with suppress(asyncio.CancelledError):

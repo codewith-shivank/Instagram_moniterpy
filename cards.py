@@ -1,7 +1,9 @@
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
 import tempfile
 import urllib.request
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
 
 def _font(size, bold=False):
     candidates = [

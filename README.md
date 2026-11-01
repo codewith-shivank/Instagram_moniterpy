@@ -82,7 +82,7 @@ DISCORD_TOKEN=your_token
 DISCORD_GUILD_ID=your_server_id
 ```
 
-`DISCORD_GUILD_ID` is optional, but recommended while testing because guild slash commands sync quickly.
+`DISCORD_GUILD_ID` is optional. When set, the bot clears that guild's existing application commands, copies the commands currently defined in `bot.py`, and syncs the resulting set before opening the Discord gateway. This is the recommended mode while testing because guild commands update quickly. Without it, the current command set is synced globally; Discord can take up to about an hour to distribute global changes.
 
 ## 4. Run
 
@@ -114,6 +114,11 @@ You can also pass an Instagram profile URL where a username is accepted.
 ## Hosting
 
 The project is intentionally simple: run `python bot.py` as a long-running worker.
+
+### Discord gateway/DNS failures
+
+The worker uses discord.py's built-in reconnect support and wraps the outer connection in bounded exponential backoff. Transient DNS, socket, gateway, timeout, HTTP 429, and Discord 5xx failures are retried without printing credentials. An invalid token is treated as a configuration error and stops instead of retrying forever. A hosting provider must still provide working outbound DNS and HTTPS access to `discord.com:443`; the bot cannot repair a provider-level network outage.
+
 
 If your host has an ephemeral filesystem, SQLite may be deleted when the instance is recreated. Use persistent storage or replace `database.py` with a hosted database such as PostgreSQL.
 
@@ -148,6 +153,29 @@ The included `.gitignore` prevents both.
 ### Slash commands do not appear
 
 Set `DISCORD_GUILD_ID` to the ID of your Discord server and restart the bot.
+The bot replaces the configured guild's command set on every successful gateway
+connection, so removed commands are cleared and current definitions are synced.
+If Discord is temporarily unavailable, synchronization is retried automatically.
+
+If an old command still appears, confirm `DISCORD_GUILD_ID` is the same server
+where the command is being used, then restart the worker once after saving the
+environment variable.
+
+### ACLCloud shows `401 Unauthorized` or `Improper token has been passed`
+
+`DISCORD_TOKEN` is invalid, expired, or includes copied quotes/whitespace. In the
+Discord Developer Portal, reset the bot token, copy the new token, and replace
+the ACLCloud environment variable with the raw token value (do not include
+`DISCORD_TOKEN=`, quotes, or backticks). Restart the server after saving it.
+
+### ACLCloud shows `Cannot connect to host discord.com` or `socket.gaierror`
+
+This is a DNS/network failure on the hosting server, not an Instagram or bot
+logic error. The bot now retries transient gateway/DNS failures with bounded
+backoff and resumes monitoring after reconnecting. Restart the ACLCloud server
+and verify that outbound HTTPS/DNS access is enabled. If it continues, contact
+ACLCloud support or move the worker to a host with working DNS access to
+`discord.com:443`.
 
 ### Instagram says UNKNOWN
 
