@@ -5,4 +5,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+instagram-monitor-tests.db
 

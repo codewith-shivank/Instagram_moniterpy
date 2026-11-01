@@ -82,6 +82,20 @@ DISCORD_TOKEN=your_token
 DISCORD_GUILD_ID=your_server_id
 ```
 
+In the Discord Developer Portal, open **Bot → Privileged Gateway Intents** and enable
+**Message Content Intent**. The bot enables this intent for compatibility with the
+prefix-command parser; slash commands still remain the primary interface.
+
+If Instagram starts rate-limiting the host, optionally configure a logged-in session
+and less aggressive checking:
+
+```env
+INSTAGRAM_SESSIONID=your_sessionid
+INSTAGRAM_CACHE_SECONDS=60
+INSTAGRAM_RETRY_COUNT=2
+INSTAGRAM_FETCH_LATEST_POST=0
+```
+
 `DISCORD_GUILD_ID` is optional. When set, the bot clears that guild's existing application commands, copies the commands currently defined in `bot.py`, and syncs the resulting set before opening the Discord gateway. This is the recommended mode while testing because guild commands update quickly. Without it, the current command set is synced globally; Discord can take up to about an hour to distribute global changes.
 
 ## 4. Run

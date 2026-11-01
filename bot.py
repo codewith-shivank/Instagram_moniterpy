@@ -45,6 +45,15 @@ logging.basicConfig(
 log = logging.getLogger("shivannnkk-instagram-monitor")
 
 intents = discord.Intents.default()
+# Required only for the legacy prefix command parser; slash commands do not need it.
+intents.message_content = True
+
+
+class ReliableCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Acknowledge every slash command before its callback performs any I/O.
+        await defer_interaction(interaction)
+        return True
 
 
 class MonitorBot(commands.Bot):
@@ -52,7 +61,7 @@ class MonitorBot(commands.Bot):
         await sync_commands()
 
 
-bot = MonitorBot(command_prefix="!", intents=intents)
+bot = MonitorBot(command_prefix="!", intents=intents, tree_cls=ReliableCommandTree)
 db = Database(os.getenv("STATE_FILE", "monitor.db"))
 checker = InstagramChecker()
 command_sync_lock = asyncio.Lock()
@@ -562,6 +571,7 @@ async def summary_loop():
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_loop():
+    # Filter by guild here so a server never receives another server's alerts.
     monitors = db.get_monitors()
     for monitor in monitors:
         try:
